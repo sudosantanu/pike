@@ -29,17 +29,13 @@ maintaining a clear visual distinction between values and types.
 from __future__ import absolute_import
 from builtins import str
 from builtins import range
-
+import pdb
 import array
 import re
-
+import ipaddress
 from . import core
 from . import nttime
 from . import ntstatus
-
-
-# for credit cost calculations
-BYTES_PER_CREDIT = 64 * 1024
 
 
 # Dialects constants
@@ -127,8 +123,8 @@ class ShareFlags(core.FlagEnum):
 ShareFlags.import_items(globals())
 
 # Misc
-RELATED_FID = (2**64 - 1, 2**64 - 1)
-UNSOLICITED_MESSAGE_ID = 2**64 - 1
+RELATED_FID = (2 ** 64 - 1, 2 ** 64 - 1)
+UNSOLICITED_MESSAGE_ID = 2 ** 64 - 1
 
 
 class Smb2(core.Frame):
@@ -1086,12 +1082,7 @@ class CreateRequest(Request):
         self._create_contexts = []
 
     def _log_str(self):
-        return " ".join(
-            [
-                super(CreateRequest, self)._log_str(),
-                self.name,
-            ]
-        )
+        return " ".join([super(CreateRequest, self)._log_str(), self.name,])
 
     def _children(self):
         return self._create_contexts
@@ -1363,7 +1354,6 @@ class LeaseFlags(core.FlagEnum):
     SMB2_LEASE_FLAG_NONE = 0x00
     SMB2_LEASE_FLAG_BREAK_IN_PROGRESS = 0x02
     SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET = 0x04
-
 
 LeaseFlags.import_items(globals())
 
@@ -1851,7 +1841,7 @@ class LeaseRequest(CreateRequestContext):
         else:
             self.lease_flags = None
             self.parent_lease_key = None
-            self.epoch = None
+            self.epoch = None 
 
     def _encode(self, cur):
         cur.encode_bytes(self.lease_key)
@@ -2288,8 +2278,6 @@ class QueryInfoRequest(Request):
         self.flags = 0
         self.file_id = None
         self.output_buffer_length = 4096
-        # used for SMB2_QUERY_QUOTA_INFO and FILE_GET_EA_INFORMATION
-        self._entries = []
 
     def _log_str(self):
         components = [
@@ -2304,32 +2292,22 @@ class QueryInfoRequest(Request):
             components.append("({})".format(self.flags))
         return " ".join(components)
 
-    def _children(self):
-        return self._entries
-
-    def append(self, e):
-        self._entries.append(e)
-
     def _encode(self, cur):
         cur.encode_uint8le(self.info_type)
         cur.encode_uint8le(self.file_information_class)
         cur.encode_uint32le(self.output_buffer_length)
 
-        input_buffer_offset_hole = cur.hole.encode_uint16le(0)
+        # We're not implementing the input buffer support right now
+        cur.encode_uint16le(0)
         cur.encode_uint16le(0)  # Reserved
-        input_buffer_length_hole = cur.hole.encode_uint32le(0)
+
+        # We're not implementing the input buffer support right now
+        cur.encode_uint32le(0)
 
         cur.encode_uint32le(self.additional_information)
         cur.encode_uint32le(self.flags)
         cur.encode_uint64le(self.file_id[0])
         cur.encode_uint64le(self.file_id[1])
-
-        if self._entries:
-            buffer_start = cur.copy()
-            input_buffer_offset_hole(buffer_start - self.parent.start)
-            for info in self._entries:
-                info.encode(cur)
-            input_buffer_length_hole(cur - buffer_start)
 
 
 class QueryInfoResponse(Response):
@@ -2378,15 +2356,7 @@ class QueryInfoResponse(Response):
             else:
                 with cur.bounded(cur, end):
                     while cur < end:
-                        try:
-                            info_cls(self).decode(cur)
-                        except core.BufferOverrun:
-                            if len(self) <= 1:
-                                raise
-                            # remove the overflowed entry and exit loop
-                            self._entries.pop()
-                            break
-
+                        info_cls(self).decode(cur)
         else:
             Information(self, end).decode(cur)
 
@@ -2625,60 +2595,6 @@ class FileSecurityInformation(FileInformation):
                 self.offset_dacl = cur - self.start
             dacl_ofs(self.offset_dacl)
             self.dacl.encode(cur)
-
-
-class FileQuotaInformation(FileInformation):
-    file_information_class = 0
-    info_type = SMB2_0_INFO_QUOTA
-
-    def __init__(self, parent=None):
-        super(FileQuotaInformation, self).__init__(parent)
-        self.change_time = 0
-        self.quota_used = 0
-        self.quota_threshold = 0
-        self.quota_limit = 0
-        self.sid = None
-
-    def _decode(self, cur):
-        next_entry_offset = cur.decode_uint32le()
-        sid_length = cur.decode_uint32le()
-
-        self.change_time = cur.decode_uint64le()
-        self.quota_used = cur.decode_uint64le()
-        self.quota_threshold = cur.decode_uint64le()
-        self.quota_limit = cur.decode_uint64le()
-        self.sid = NT_SID()
-        with cur.bounded(cur, cur + sid_length):
-            self.sid.decode(cur)
-        if next_entry_offset:
-            cur.advanceto(self.start + next_entry_offset)
-            # recursively decode all quota info structs
-            FileQuotaInformation(self.parent).decode(cur)
-        else:
-            cur.advanceto(cur.upperbound)
-
-
-class QueryQuotaInfo(core.Frame):
-    def __init__(self, parent=None):
-        super(QueryQuotaInfo, self).__init__(parent)
-        if parent is not None:
-            parent.append(self)
-        self.return_single = False
-        self.restart_scan = False
-
-    def _encode(self, cur):
-        cur.encode_uint8le(self.return_single)
-        cur.encode_uint8le(self.restart_scan)
-        cur.encode_uint16le(0)  # reserved
-
-        # the following fields are not yet implemented, but allow the client
-        # to request quota information for particular SIDs
-        # setting these to zero indicates that ALL quota entries are queried
-        cur.encode_uint32le(0)  # sid_list_length
-        cur.encode_uint32le(0)  # start_sid_length
-        cur.encode_uint32le(0)  # start_sid_offset
-        # sid_buffer would be encoded here if it were included
-        # [MS-SMB2] 2.2.37.1 SMB2_QUERY_QUOTA_INFO
 
 
 class FileAccessInformation(FileInformation):
@@ -3710,10 +3626,7 @@ class ReadResponse(Response):
 
     def _log_str(self):
         return " ".join(
-            [
-                super(ReadResponse, self)._log_str(),
-                "({})".format(self.length),
-            ]
+            [super(ReadResponse, self)._log_str(), "({})".format(self.length),]
         )
 
     def _decode(self, cur):
@@ -4161,6 +4074,20 @@ class ValidateNegotiateInfoResponse(IoctlOutput):
         self.security_mode = SecurityMode(cur.decode_uint16le())
         self.dialect = Dialect(cur.decode_uint16le())
 
+ 
+class AddressFamily(core.ValueEnum):
+    IPv4 = 0x0002
+    IPv6 = 0x0017
+
+AddressFamily.import_items(globals())
+
+
+class Capability(core.FlagEnum):
+     RSS_CAPABLE    = 0x00000001
+     RDMA_CAPABLE   = 0x00000002
+
+Capability.import_items(globals())
+
 
 class QueryNetworkInterfaceInfoResponse(IoctlOutput):
     ioctl_ctl_code = FSCTL_QUERY_NETWORK_INTERFACE_INFO
@@ -4169,8 +4096,44 @@ class QueryNetworkInterfaceInfoResponse(IoctlOutput):
         IoctlOutput.__init__(self, parent)
 
     def _decode(self, cur):
-        pass
-
+        """
+        pdb.set_trace()
+        """
+        self.next_loc ={}
+        self.if_index = {}
+        self.capability = {}
+        self.reserved = {}
+        self.link_speed = {}
+        self.family = {}
+        self.port = {}
+        self.ip_address = {}
+        self.flow_info = {}
+        self.scope_id = {}
+        self.reserved_2 ={}
+        self.reserved_3 = {}
+        i = 0
+        while True :
+                self.next_loc[i] = cur.decode_uint32le()
+                self.if_index[i] =  cur.decode_uint32le()
+                self.capability[i] = Capability(cur.decode_uint32le())
+                self.reserved[i] =  cur.decode_uint32le()
+                self.link_speed[i] = cur.decode_uint64le()
+                self.family[i] = AddressFamily(cur.decode_uint16le())
+                self.port[i] = cur.decode_uint16le()
+                if self.family[i] == IPv4 : #IPv4
+                        self.ip_address[i] = str(ipaddress.ip_address(cur.decode_uint32be()))
+                        self.reserved_2[i] = cur.decode_uint64le()
+                        self.reserved_3[i] = cur.decode_bytes(112)
+                if self.family[i] == IPv6 : #IPv6
+                        self.flow_info[i] = cur.decode_uint32le()
+                        self.ip_address[i] =  binascii.hexlify(cur.decode_bytes(16))
+                        self.scope_id[i] = cur.decode_uint32le()
+                        self.reserved_3[i] = cur.decode_bytes(100)
+                if self.next_loc[i] == 0:
+                        break
+                i = i+1
+    def get_ips(self):
+        return self.ip_address
 
 class RequestResumeKeyResponse(IoctlOutput):
     ioctl_ctl_code = FSCTL_SRV_REQUEST_RESUME_KEY
